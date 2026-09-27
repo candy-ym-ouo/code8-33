@@ -60,6 +60,7 @@ export const timelineRoutes: FastifyPluginAsync = async (app) => {
         bookTitle: event.book?.title ?? '已删除书目',
         entityType: event.entityType,
         entityId: event.entityId,
+        entityVersion: event.entityVersion,
         action: event.action,
         payload: event.payloadJson,
         occurredAt: event.occurredAt

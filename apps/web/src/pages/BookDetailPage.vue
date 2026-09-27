@@ -31,7 +31,7 @@ const book = ref<Book | null>(null);
 const bookView = computed(() => book.value as Book);
 const traces = ref<Trace[]>([]);
 const reflections = ref<Reflection[]>([]);
-const activities = ref<Array<{ id: string; action: keyof typeof ACTION_LABELS; entityType: keyof typeof ENTITY_LABELS; payload: Record<string, unknown>; occurredAt: string }>>([]);
+const activities = ref<Array<{ id: string; action: keyof typeof ACTION_LABELS; entityType: keyof typeof ENTITY_LABELS; payload: Record<string, unknown>; occurredAt: string; entityVersion?: number }>>([]);
 const loading = ref(true);
 const saving = ref(false);
 const error = ref('');
@@ -527,6 +527,7 @@ onMounted(load);
             <strong>{{ ACTION_LABELS[event.action] }}{{ ENTITY_LABELS[event.entityType] }}</strong>
             <p>{{ eventSummary(event.payload) || '记录随时间更新' }}</p>
             <time :datetime="event.occurredAt">{{ formatDateTime(event.occurredAt) }}</time>
+            <span v-if="event.entityVersion !== undefined" class="muted"> · v{{ event.entityVersion }}</span>
           </div>
         </article>
         <p v-if="activities.length === 0" class="empty-inline">这本书还没有变化记录。</p>

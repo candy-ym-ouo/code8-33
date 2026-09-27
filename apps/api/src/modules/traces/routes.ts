@@ -6,7 +6,9 @@ import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { isRestoreWindowOpen, normalizeText, validatePageRange, validateSinglePage } from '../../lib/domain.js';
-import { writeEvent } from '../../lib/events.js';
+import { loadEntityFold, writeEvent } from '../../lib/events.js';
+import { adjudicateMutation, revisionConflictError, type MutationKind } from '../../lib/revisions.js';
+import { annotationSnapshot, dogEarSnapshot, rereadMarkSnapshot } from '../../lib/snapshots.js';
 import { optionalDate, paginationFromQuery, parseId } from '../../lib/http.js';
 
 const optionalReason = (max: number) =>
@@ -64,6 +66,8 @@ const rereadUpdateSchema = z
 
 const deleteSchema = z.object({ version: z.number().int().positive().optional() }).optional();
 
+const restoreSchema = z.object({ version: z.number().int().positive().optional() }).optional();
+
 function serializeDogEar(item: {
   id: string;
   bookId: string;
@@ -101,10 +105,21 @@ function serializeRereadMark(item: {
   return { ...item, type: 'REREAD_MARK' as const };
 }
 
-function assertVersion(current: number, requested?: number): void {
-  if (requested && requested !== current) {
-    throw new AppError(409, 'STALE_WRITE', '记录已在其他位置被修改，请刷新后重试');
-  }
+/**
+ * 基于事件链判定一次变更是否允许提交。
+ * 判定只依赖存量事件，任何时刻都可以重放复算。
+ */
+async function adjudicate(
+  tx: Prisma.TransactionClient,
+  entityType: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK',
+  entityId: string,
+  mutation: MutationKind,
+  clientVersion?: number
+): Promise<{ headVersion: number; nextVersion: number }> {
+  const fold = await loadEntityFold(tx, entityType, entityId);
+  const verdict = adjudicateMutation(fold, mutation, clientVersion);
+  if (verdict.kind === 'REJECT') throw revisionConflictError(verdict.code);
+  return { headVersion: fold.version, nextVersion: verdict.nextVersion };
 }
 
 function eventSummary(value: string | null | undefined): string {
@@ -219,8 +234,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
           bookId,
           entityType: 'DOG_EAR',
           entityId: created.id,
+          entityVersion: 1,
           action: 'CREATED',
-          payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
+          payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) },
+          snapshot: dogEarSnapshot(created),
+          baseVersion: null
         });
         return created;
       });
@@ -239,11 +257,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '折角信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     const existing = await prisma.dogEar.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       include: { book: true }
     });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '折角不存在');
-    assertVersion(existing.version, parsed.data.version);
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '折角不存在');
+    if (existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '折角不存在');
     const nextPage = parsed.data.pageNumber ?? existing.pageNumber;
     validateSinglePage(nextPage, existing.book.pageCount);
     const nextReason =
@@ -259,24 +277,29 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '目标页已有折角');
     }
     const updated = await prisma.$transaction(async (tx) => {
+      const { headVersion, nextVersion } = await adjudicate(tx, 'DOG_EAR', id, 'UPDATE', parsed.data.version);
       const result = await tx.dogEar.updateMany({
-        where: { id, userId, version: existing.version, deletedAt: null },
+        where: { id, userId, version: headVersion, deletedAt: null },
         data: {
           pageNumber: nextPage,
           reason: nextReason,
           version: { increment: 1 }
         }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '折角已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const row = await tx.dogEar.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'DOG_EAR',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'UPDATED',
-        payload: { pageNumber: nextPage, reason: eventSummary(nextReason) }
+        payload: { pageNumber: nextPage, reason: eventSummary(nextReason) },
+        snapshot: dogEarSnapshot(row),
+        baseVersion: parsed.data.version ?? null
       });
-      return tx.dogEar.findUniqueOrThrow({ where: { id } });
+      return row;
     });
     return { dogEar: serializeDogEar(updated) };
   });
@@ -286,22 +309,25 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = deleteSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '删除参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const existing = await prisma.dogEar.findFirst({ where: { id, userId, deletedAt: null } });
+    const existing = await prisma.dogEar.findFirst({ where: { id, userId } });
     if (!existing) throw new AppError(404, 'NOT_FOUND', '折角不存在');
-    assertVersion(existing.version, parsed.data?.version);
     await prisma.$transaction(async (tx) => {
+      const { headVersion, nextVersion } = await adjudicate(tx, 'DOG_EAR', id, 'DELETE', parsed.data?.version);
       const result = await tx.dogEar.updateMany({
-        where: { id, userId, deletedAt: null, version: existing.version },
+        where: { id, userId, deletedAt: null, version: headVersion },
         data: { deletedAt: new Date(), version: { increment: 1 } }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '折角已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'DOG_EAR',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'DELETED',
-        payload: { pageNumber: existing.pageNumber }
+        payload: { pageNumber: existing.pageNumber },
+        snapshot: dogEarSnapshot(existing),
+        baseVersion: parsed.data?.version ?? null
       });
     });
     return reply.status(204).send();
@@ -309,29 +335,39 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/dog-ears/:dogEarId/restore', async (request) => {
     const id = parseId((request.params as { dogEarId: string }).dogEarId, 'dogEarId');
+    const parsed = restoreSchema.safeParse(request.body);
+    if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '恢复参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     const existing = await prisma.dogEar.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除折角不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '已删除折角不存在');
+    if (existing.deletedAt) {
+      if (!isRestoreWindowOpen(existing.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
+      const duplicate = await prisma.dogEar.findFirst({
+        where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
+      });
+      if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
     }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
-    const duplicate = await prisma.dogEar.findFirst({
-      where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
-    });
-    if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.dogEar.update({
-        where: { id },
+      const { headVersion, nextVersion } = await adjudicate(tx, 'DOG_EAR', id, 'RESTORE', parsed.data?.version);
+      const result = await tx.dogEar.updateMany({
+        where: { id, userId, version: headVersion, deletedAt: { not: null } },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const value = await tx.dogEar.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'DOG_EAR',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
+        payload: { pageNumber: value.pageNumber },
+        snapshot: dogEarSnapshot(value),
+        baseVersion: parsed.data?.version ?? null
       });
       return value;
     });
@@ -361,8 +397,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         bookId,
         entityType: 'ANNOTATION',
         entityId: created.id,
+        entityVersion: 1,
         action: 'CREATED',
-        payload: { startPage: created.startPage, endPage: created.endPage, summary: eventSummary(created.content) }
+        payload: { startPage: created.startPage, endPage: created.endPage, summary: eventSummary(created.content) },
+        snapshot: annotationSnapshot(created),
+        baseVersion: null
       });
       return created;
     });
@@ -375,34 +414,40 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '批注信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     const existing = await prisma.annotation.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       include: { book: true }
     });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '批注不存在');
-    assertVersion(existing.version, parsed.data.version);
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '批注不存在');
+    if (existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '批注不存在');
     const startPage = parsed.data.startPage ?? existing.startPage;
     const endPage = parsed.data.endPage ?? existing.endPage;
     validatePageRange(startPage, endPage, existing.book.pageCount);
+    const content = parsed.data.content !== undefined ? normalizeText(parsed.data.content) : existing.content;
     const updated = await prisma.$transaction(async (tx) => {
+      const { headVersion, nextVersion } = await adjudicate(tx, 'ANNOTATION', id, 'UPDATE', parsed.data.version);
       const result = await tx.annotation.updateMany({
-        where: { id, userId, deletedAt: null, version: existing.version },
+        where: { id, userId, deletedAt: null, version: headVersion },
         data: {
           startPage,
           endPage,
-          ...(parsed.data.content !== undefined ? { content: normalizeText(parsed.data.content) } : {}),
+          content,
           version: { increment: 1 }
         }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '批注已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const row = await tx.annotation.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'ANNOTATION',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'UPDATED',
-        payload: { startPage, endPage }
+        payload: { startPage, endPage },
+        snapshot: annotationSnapshot(row),
+        baseVersion: parsed.data.version ?? null
       });
-      return tx.annotation.findUniqueOrThrow({ where: { id } });
+      return row;
     });
     return { annotation: serializeAnnotation(updated) };
   });
@@ -412,22 +457,25 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = deleteSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '删除参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const existing = await prisma.annotation.findFirst({ where: { id, userId, deletedAt: null } });
+    const existing = await prisma.annotation.findFirst({ where: { id, userId } });
     if (!existing) throw new AppError(404, 'NOT_FOUND', '批注不存在');
-    assertVersion(existing.version, parsed.data?.version);
     await prisma.$transaction(async (tx) => {
+      const { headVersion, nextVersion } = await adjudicate(tx, 'ANNOTATION', id, 'DELETE', parsed.data?.version);
       const result = await tx.annotation.updateMany({
-        where: { id, userId, deletedAt: null, version: existing.version },
+        where: { id, userId, deletedAt: null, version: headVersion },
         data: { deletedAt: new Date(), version: { increment: 1 } }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '批注已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'ANNOTATION',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'DELETED',
-        payload: { startPage: existing.startPage, endPage: existing.endPage }
+        payload: { startPage: existing.startPage, endPage: existing.endPage },
+        snapshot: annotationSnapshot(existing),
+        baseVersion: parsed.data?.version ?? null
       });
     });
     return reply.status(204).send();
@@ -435,25 +483,35 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/annotations/:annotationId/restore', async (request) => {
     const id = parseId((request.params as { annotationId: string }).annotationId, 'annotationId');
+    const parsed = restoreSchema.safeParse(request.body);
+    if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '恢复参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     const existing = await prisma.annotation.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除批注不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '已删除批注不存在');
+    if (existing.deletedAt) {
+      if (!isRestoreWindowOpen(existing.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.annotation.update({
-        where: { id },
+      const { headVersion, nextVersion } = await adjudicate(tx, 'ANNOTATION', id, 'RESTORE', parsed.data?.version);
+      const result = await tx.annotation.updateMany({
+        where: { id, userId, version: headVersion, deletedAt: { not: null } },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const value = await tx.annotation.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'ANNOTATION',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'RESTORED',
-        payload: { startPage: value.startPage, endPage: value.endPage }
+        payload: { startPage: value.startPage, endPage: value.endPage },
+        snapshot: annotationSnapshot(value),
+        baseVersion: parsed.data?.version ?? null
       });
       return value;
     });
@@ -482,8 +540,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         bookId,
         entityType: 'REREAD_MARK',
         entityId: created.id,
+        entityVersion: 1,
         action: 'CREATED',
-        payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
+        payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) },
+        snapshot: rereadMarkSnapshot(created),
+        baseVersion: null
       });
       return created;
     });
@@ -496,11 +557,11 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '重读信息无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     const existing = await prisma.rereadMark.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       include: { book: true }
     });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '重读记录不存在');
-    assertVersion(existing.version, parsed.data.version);
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '重读记录不存在');
+    if (existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '重读记录不存在');
     const pageNumber = parsed.data.pageNumber ?? existing.pageNumber;
     validateSinglePage(pageNumber, existing.book.pageCount);
     const reason =
@@ -510,20 +571,25 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
           ? normalizeText(parsed.data.reason)
           : null;
     const updated = await prisma.$transaction(async (tx) => {
+      const { headVersion, nextVersion } = await adjudicate(tx, 'REREAD_MARK', id, 'UPDATE', parsed.data.version);
       const result = await tx.rereadMark.updateMany({
-        where: { id, userId, deletedAt: null, version: existing.version },
+        where: { id, userId, deletedAt: null, version: headVersion },
         data: { pageNumber, reason, version: { increment: 1 } }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '重读记录已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const row = await tx.rereadMark.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'REREAD_MARK',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'UPDATED',
-        payload: { pageNumber, reason: eventSummary(reason) }
+        payload: { pageNumber, reason: eventSummary(reason) },
+        snapshot: rereadMarkSnapshot(row),
+        baseVersion: parsed.data.version ?? null
       });
-      return tx.rereadMark.findUniqueOrThrow({ where: { id } });
+      return row;
     });
     return { rereadMark: serializeRereadMark(updated) };
   });
@@ -533,22 +599,25 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     const parsed = deleteSchema.safeParse(request.body);
     if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '删除参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
-    const existing = await prisma.rereadMark.findFirst({ where: { id, userId, deletedAt: null } });
+    const existing = await prisma.rereadMark.findFirst({ where: { id, userId } });
     if (!existing) throw new AppError(404, 'NOT_FOUND', '重读记录不存在');
-    assertVersion(existing.version, parsed.data?.version);
     await prisma.$transaction(async (tx) => {
+      const { headVersion, nextVersion } = await adjudicate(tx, 'REREAD_MARK', id, 'DELETE', parsed.data?.version);
       const result = await tx.rereadMark.updateMany({
-        where: { id, userId, deletedAt: null, version: existing.version },
+        where: { id, userId, deletedAt: null, version: headVersion },
         data: { deletedAt: new Date(), version: { increment: 1 } }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '重读记录已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'REREAD_MARK',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'DELETED',
-        payload: { pageNumber: existing.pageNumber }
+        payload: { pageNumber: existing.pageNumber },
+        snapshot: rereadMarkSnapshot(existing),
+        baseVersion: parsed.data?.version ?? null
       });
     });
     return reply.status(204).send();
@@ -556,25 +625,35 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/reread-marks/:rereadMarkId/restore', async (request) => {
     const id = parseId((request.params as { rereadMarkId: string }).rereadMarkId, 'rereadMarkId');
+    const parsed = restoreSchema.safeParse(request.body);
+    if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '恢复参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     const existing = await prisma.rereadMark.findFirst({ where: { id, userId }, include: { book: true } });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除重读记录不存在');
-    if (!isRestoreWindowOpen(existing.deletedAt)) {
-      throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '已删除重读记录不存在');
+    if (existing.deletedAt) {
+      if (!isRestoreWindowOpen(existing.deletedAt)) {
+        throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
+      }
+      if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.rereadMark.update({
-        where: { id },
+      const { headVersion, nextVersion } = await adjudicate(tx, 'REREAD_MARK', id, 'RESTORE', parsed.data?.version);
+      const result = await tx.rereadMark.updateMany({
+        where: { id, userId, version: headVersion, deletedAt: { not: null } },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const value = await tx.rereadMark.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'REREAD_MARK',
         entityId: id,
+        entityVersion: nextVersion,
         action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
+        payload: { pageNumber: value.pageNumber },
+        snapshot: rereadMarkSnapshot(value),
+        baseVersion: parsed.data?.version ?? null
       });
       return value;
     });

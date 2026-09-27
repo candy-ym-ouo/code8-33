@@ -88,6 +88,8 @@ export interface TimelineEvent {
   bookTitle: string;
   entityType: ActivityEntityType;
   entityId: string | null;
+  /** 该事件对应的实体修订号；缺失时为迁移前的存量事件。 */
+  entityVersion?: number;
   action: ActivityAction;
   payload: Record<string, unknown>;
   occurredAt: string;

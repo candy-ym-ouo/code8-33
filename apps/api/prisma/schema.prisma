@@ -192,14 +192,15 @@ model CompletionReflection {
 }
 
 model ActivityEvent {
-  id          String             @id @default(uuid()) @db.Uuid
-  userId      String             @map("user_id") @db.Uuid
-  bookId      String?            @map("book_id") @db.Uuid
-  entityType  ActivityEntityType @map("entity_type")
-  entityId    String?            @map("entity_id") @db.Uuid
-  action      ActivityAction
-  payloadJson Json               @default("{}") @map("payload_json")
-  occurredAt  DateTime           @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  id            String             @id @default(uuid()) @db.Uuid
+  userId        String             @map("user_id") @db.Uuid
+  bookId        String?            @map("book_id") @db.Uuid
+  entityType    ActivityEntityType @map("entity_type")
+  entityId      String?            @map("entity_id") @db.Uuid
+  entityVersion Int                @map("entity_version")
+  action        ActivityAction
+  payloadJson   Json               @default("{}") @map("payload_json")
+  occurredAt    DateTime           @default(now()) @map("occurred_at") @db.Timestamptz(3)
 
   user User  @relation(fields: [userId], references: [id], onDelete: Restrict)
   book Book? @relation(fields: [bookId], references: [id], onDelete: Restrict)
@@ -207,5 +208,6 @@ model ActivityEvent {
   @@index([userId, occurredAt])
   @@index([userId, bookId, occurredAt])
   @@index([userId, entityType, occurredAt])
+  @@index([entityType, entityId, entityVersion])
   @@map("activity_events")
 }

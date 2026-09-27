@@ -5,7 +5,9 @@ import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { isStrictlyEditable, normalizeMoodTags, normalizeText } from '../../lib/domain.js';
-import { writeEvent } from '../../lib/events.js';
+import { loadEntityFold, writeEvent } from '../../lib/events.js';
+import { adjudicateMutation, revisionConflictError } from '../../lib/revisions.js';
+import { bookSnapshot, reflectionSnapshot } from '../../lib/snapshots.js';
 import { parseId } from '../../lib/http.js';
 
 const updateSchema = z
@@ -19,6 +21,8 @@ const updateSchema = z
   });
 
 const deleteSchema = z.object({ version: z.number().int().positive().optional() }).optional();
+
+const restoreSchema = z.object({ version: z.number().int().positive().optional() }).optional();
 
 function serialize(item: {
   id: string;
@@ -46,12 +50,6 @@ function serialize(item: {
   };
 }
 
-function assertVersion(current: number, requested?: number): void {
-  if (requested && requested !== current) {
-    throw new AppError(409, 'STALE_WRITE', '完成感受已在其他位置被修改，请刷新后重试');
-  }
-}
-
 export const reflectionRoutes: FastifyPluginAsync = async (app) => {
   app.addHook('preHandler', requireAuth);
 
@@ -75,14 +73,14 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
     }
     const userId = currentUser(request).id;
     const existing = await prisma.completionReflection.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       include: { book: true }
     });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '完成感受不存在');
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '完成感受不存在');
+    if (existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '完成感受不存在');
     if (!isStrictlyEditable(existing.editableUntil)) {
       throw new AppError(409, 'EDIT_WINDOW_EXPIRED', '完成感受已超过 7 天可编辑期');
     }
-    assertVersion(existing.version, parsed.data.version);
     const moodTags = parsed.data.moodTags ? normalizeMoodTags(parsed.data.moodTags) : existing.moodTags;
     const reflection =
       parsed.data.text === undefined
@@ -91,24 +89,31 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
           ? normalizeText(parsed.data.text)
           : null;
     const updated = await prisma.$transaction(async (tx) => {
+      const fold = await loadEntityFold(tx, 'COMPLETION_REFLECTION', id);
+      const verdict = adjudicateMutation(fold, 'UPDATE', parsed.data.version);
+      if (verdict.kind === 'REJECT') throw revisionConflictError(verdict.code);
       const result = await tx.completionReflection.updateMany({
-        where: { id, userId, deletedAt: null, version: existing.version },
+        where: { id, userId, deletedAt: null, version: fold.version },
         data: { moodTags, reflection, version: { increment: 1 } }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '完成感受已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const row = await tx.completionReflection.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'COMPLETION_REFLECTION',
         entityId: id,
+        entityVersion: verdict.nextVersion,
         action: 'UPDATED',
         payload: {
           completionRound: existing.completionRound,
           moodTags,
           summary: reflection ? reflection.slice(0, 120) : ''
-        }
+        },
+        snapshot: reflectionSnapshot(row),
+        baseVersion: parsed.data.version ?? null
       });
-      return tx.completionReflection.findUniqueOrThrow({ where: { id } });
+      return row;
     });
     return { reflection: serialize(updated) };
   });
@@ -121,47 +126,58 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
     }
     const userId = currentUser(request).id;
     const existing = await prisma.completionReflection.findFirst({
-      where: { id, userId, deletedAt: null },
+      where: { id, userId },
       include: { book: true }
     });
-    if (!existing || existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '完成感受不存在');
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '完成感受不存在');
+    if (existing.book.deletedAt) throw new AppError(404, 'NOT_FOUND', '完成感受不存在');
     if (!isStrictlyEditable(existing.editableUntil)) {
       throw new AppError(409, 'EDIT_WINDOW_EXPIRED', '完成感受已超过 7 天可编辑期');
     }
-    assertVersion(existing.version, parsed.data?.version);
 
     await prisma.$transaction(async (tx) => {
+      const fold = await loadEntityFold(tx, 'COMPLETION_REFLECTION', id);
+      const verdict = adjudicateMutation(fold, 'DELETE', parsed.data?.version);
+      if (verdict.kind === 'REJECT') throw revisionConflictError(verdict.code);
       await tx.$queryRaw`SELECT id FROM books WHERE id = ${existing.bookId}::uuid FOR UPDATE`;
       const currentBook = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
       const result = await tx.completionReflection.updateMany({
-        where: { id, userId, deletedAt: null, version: existing.version },
+        where: { id, userId, deletedAt: null, version: fold.version },
         data: { deletedAt: new Date(), version: { increment: 1 } }
       });
-      if (result.count !== 1) throw new AppError(409, 'STALE_WRITE', '完成感受已在其他位置被修改');
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'COMPLETION_REFLECTION',
         entityId: id,
+        entityVersion: verdict.nextVersion,
         action: 'DELETED',
-        payload: { completionRound: existing.completionRound }
+        payload: { completionRound: existing.completionRound },
+        snapshot: reflectionSnapshot(existing),
+        baseVersion: parsed.data?.version ?? null
       });
       const latestActive = await tx.completionReflection.aggregate({
         where: { bookId: existing.bookId, deletedAt: null },
         _max: { completionRound: true }
       });
       if (currentBook.status === 'READ' && (latestActive._max.completionRound ?? 0) < existing.completionRound) {
+        const bookFold = await loadEntityFold(tx, 'BOOK', existing.bookId);
         await tx.book.update({
           where: { id: existing.bookId },
           data: { status: 'READING', version: { increment: 1 } }
         });
+        const updatedBook = await tx.book.findUniqueOrThrow({ where: { id: existing.bookId } });
         await writeEvent(tx, {
           userId,
           bookId: existing.bookId,
           entityType: 'BOOK',
           entityId: existing.bookId,
+          entityVersion: bookFold.version + 1,
           action: 'STATUS_CHANGED',
-          payload: { previousStatus: 'READ', nextStatus: 'READING', reason: 'reflection_deleted' }
+          payload: { previousStatus: 'READ', nextStatus: 'READING', reason: 'reflection_deleted' },
+          snapshot: bookSnapshot(updatedBook),
+          baseVersion: null
         });
       }
     });
@@ -170,18 +186,25 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/reflections/:reflectionId/restore', async (request) => {
     const id = parseId((request.params as { reflectionId: string }).reflectionId, 'reflectionId');
+    const parsed = restoreSchema.safeParse(request.body);
+    if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '恢复参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     const existing = await prisma.completionReflection.findFirst({
       where: { id, userId },
       include: { book: true }
     });
-    if (!existing || !existing.deletedAt) throw new AppError(404, 'NOT_FOUND', '已删除完成感受不存在');
-    if (!isStrictlyEditable(existing.editableUntil)) {
-      throw new AppError(409, 'EDIT_WINDOW_EXPIRED', '完成感受已超过 7 天可编辑期');
+    if (!existing) throw new AppError(404, 'NOT_FOUND', '已删除完成感受不存在');
+    if (existing.deletedAt) {
+      if (!isStrictlyEditable(existing.editableUntil)) {
+        throw new AppError(409, 'EDIT_WINDOW_EXPIRED', '完成感受已超过 7 天可编辑期');
+      }
+      if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     }
-    if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
 
     const restored = await prisma.$transaction(async (tx) => {
+      const fold = await loadEntityFold(tx, 'COMPLETION_REFLECTION', id);
+      const verdict = adjudicateMutation(fold, 'RESTORE', parsed.data?.version);
+      if (verdict.kind === 'REJECT') throw revisionConflictError(verdict.code);
       await tx.$queryRaw`SELECT id FROM books WHERE id = ${existing.bookId}::uuid FOR UPDATE`;
       const book = await tx.book.findFirstOrThrow({ where: { id: existing.bookId } });
       if (book.status !== 'READING') {
@@ -194,29 +217,39 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
       if ((latestActive._max.completionRound ?? 0) > existing.completionRound) {
         throw new AppError(409, 'RESTORE_CONFLICT', '已有更新的完成轮次，无法恢复');
       }
-      const value = await tx.completionReflection.update({
-        where: { id },
+      const result = await tx.completionReflection.updateMany({
+        where: { id, userId, version: fold.version, deletedAt: { not: null } },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const value = await tx.completionReflection.findUniqueOrThrow({ where: { id } });
+      const bookFold = await loadEntityFold(tx, 'BOOK', existing.bookId);
       await tx.book.update({
         where: { id: existing.bookId },
         data: { status: 'READ', version: { increment: 1 } }
       });
+      const updatedBook = await tx.book.findUniqueOrThrow({ where: { id: existing.bookId } });
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'COMPLETION_REFLECTION',
         entityId: id,
+        entityVersion: verdict.nextVersion,
         action: 'RESTORED',
-        payload: { completionRound: value.completionRound }
+        payload: { completionRound: value.completionRound },
+        snapshot: reflectionSnapshot(value),
+        baseVersion: parsed.data?.version ?? null
       });
       await writeEvent(tx, {
         userId,
         bookId: existing.bookId,
         entityType: 'BOOK',
         entityId: existing.bookId,
+        entityVersion: bookFold.version + 1,
         action: 'STATUS_CHANGED',
-        payload: { previousStatus: 'READING', nextStatus: 'READ', reason: 'reflection_restored' }
+        payload: { previousStatus: 'READING', nextStatus: 'READ', reason: 'reflection_restored' },
+        snapshot: bookSnapshot(updatedBook),
+        baseVersion: null
       });
       return value;
     });

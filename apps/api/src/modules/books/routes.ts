@@ -6,7 +6,9 @@ import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
 import { normalizeMoodTags, normalizeText, validateStatusTransition } from '../../lib/domain.js';
-import { writeEvent } from '../../lib/events.js';
+import { loadEntityFold, writeEvent } from '../../lib/events.js';
+import { adjudicateMutation, revisionConflictError } from '../../lib/revisions.js';
+import { bookSnapshot, reflectionSnapshot, dogEarSnapshot, annotationSnapshot, rereadMarkSnapshot } from '../../lib/snapshots.js';
 import { paginationFromQuery, parseId } from '../../lib/http.js';
 
 const nullableText = (max: number) =>
@@ -78,6 +80,8 @@ const statusSchema = z.object({
   version: z.number().int().positive().optional(),
   reflection: reflectionInputSchema.optional()
 });
+
+const deleteSchema = z.object({ version: z.number().int().positive().optional() }).optional();
 
 function serializeReflection(reflection: {
   id: string;
@@ -253,8 +257,11 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
         bookId: created.id,
         entityType: 'BOOK',
         entityId: created.id,
+        entityVersion: 1,
         action: 'CREATED',
-        payload: { bookTitle: created.title, status: created.status }
+        payload: { bookTitle: created.title, status: created.status },
+        snapshot: bookSnapshot(created),
+        baseVersion: null
       });
       return created;
     });
@@ -305,9 +312,6 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
     const userId = currentUser(request).id;
     const existing = await prisma.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
     if (!existing) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-    if (parsed.data.version && parsed.data.version !== existing.version) {
-      throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
-    }
     if (parsed.data.pageCount !== undefined && parsed.data.pageCount !== null) {
       const maxPage = await maximumTracePage(userId, bookId);
       if (parsed.data.pageCount < maxPage) {
@@ -327,25 +331,32 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
     if (Object.keys(data).length === 0) return { book: serializeBook(existing) };
 
     const result = await prisma.$transaction(async (tx) => {
+      const fold = await loadEntityFold(tx, 'BOOK', bookId);
+      const verdict = adjudicateMutation(fold, 'UPDATE', parsed.data.version);
+      if (verdict.kind === 'REJECT') throw revisionConflictError(verdict.code);
       const updated = await tx.book.updateMany({
-        where: { id: bookId, userId, deletedAt: null, version: existing.version },
+        where: { id: bookId, userId, deletedAt: null, version: fold.version },
         data: { ...data, version: { increment: 1 } }
       });
       if (updated.count !== 1) {
-        throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
+        throw revisionConflictError('STALE_WRITE');
       }
+      const row = await tx.book.findUniqueOrThrow({ where: { id: bookId } });
       await writeEvent(tx, {
         userId,
         bookId,
         entityType: 'BOOK',
         entityId: bookId,
+        entityVersion: verdict.nextVersion,
         action: 'UPDATED',
         payload: {
-          bookTitle: normalizeText(parsed.data.title ?? existing.title),
-          previousStatus: existing.status,
-        }
+          bookTitle: row.title,
+          previousStatus: existing.status
+        },
+        snapshot: bookSnapshot(row),
+        baseVersion: parsed.data.version ?? null
       });
-      return tx.book.findUniqueOrThrow({ where: { id: bookId } });
+      return row;
     });
     return { book: serializeBook(result) };
   });
@@ -361,9 +372,9 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
       await tx.$queryRaw`SELECT id FROM books WHERE id = ${bookId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
       const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
       if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-      if (parsed.data.version && parsed.data.version !== book.version) {
-        throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
-      }
+      const fold = await loadEntityFold(tx, 'BOOK', bookId);
+      const verdict = adjudicateMutation(fold, 'UPDATE', parsed.data.version);
+      if (verdict.kind === 'REJECT') throw revisionConflictError(verdict.code);
       validateStatusTransition(book.status, parsed.data.status);
       if (book.status === parsed.data.status) {
         return { book, reflection: null };
@@ -405,42 +416,55 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
             createdAt: now
           }
         });
-        const updated = await tx.book.update({
-          where: { id: bookId },
+        const updatedCount = await tx.book.updateMany({
+          where: { id: bookId, version: fold.version, deletedAt: null },
           data: { status: 'READ', version: { increment: 1 } }
         });
+        if (updatedCount.count !== 1) throw revisionConflictError('STALE_WRITE');
+        const updated = await tx.book.findUniqueOrThrow({ where: { id: bookId } });
         await writeEvent(tx, {
           userId,
           bookId,
           entityType: 'BOOK',
           entityId: bookId,
+          entityVersion: verdict.nextVersion,
           action: 'STATUS_CHANGED',
-          payload: { previousStatus: book.status, nextStatus: 'READ', completionRound }
+          payload: { previousStatus: book.status, nextStatus: 'READ', completionRound },
+          snapshot: bookSnapshot(updated),
+          baseVersion: parsed.data.version ?? null
         });
         await writeEvent(tx, {
           userId,
           bookId,
           entityType: 'COMPLETION_REFLECTION',
           entityId: reflection.id,
+          entityVersion: 1,
           action: 'COMPLETED',
-          payload: { moodTags, completionRound }
+          payload: { moodTags, completionRound },
+          snapshot: reflectionSnapshot(reflection),
+          baseVersion: null
         });
         return { book: updated, reflection: serializeReflection(reflection) };
       }
 
-      const updated = await tx.book.update({
-        where: { id: bookId },
+      const changedCount = await tx.book.updateMany({
+        where: { id: bookId, version: fold.version, deletedAt: null },
         data: { status: parsed.data.status, version: { increment: 1 } }
       });
+      if (changedCount.count !== 1) throw revisionConflictError('STALE_WRITE');
+      const changed = await tx.book.findUniqueOrThrow({ where: { id: bookId } });
       await writeEvent(tx, {
         userId,
         bookId,
         entityType: 'BOOK',
         entityId: bookId,
+        entityVersion: verdict.nextVersion,
         action: 'STATUS_CHANGED',
-        payload: { previousStatus: book.status, nextStatus: parsed.data.status }
+        payload: { previousStatus: book.status, nextStatus: parsed.data.status },
+        snapshot: bookSnapshot(changed),
+        baseVersion: parsed.data.version ?? null
       });
-      return { book: updated, reflection: null };
+      return { book: changed, reflection: null };
     });
     return {
       book: serializeBook(result.book),
@@ -450,44 +474,94 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
 
   app.delete('/books/:bookId', async (request, reply) => {
     const bookId = parseId((request.params as { bookId: string }).bookId, 'bookId');
+    const parsed = deleteSchema.safeParse(request.body);
+    if (!parsed.success) throw new AppError(422, 'VALIDATION_ERROR', '删除参数无效', zodFields(parsed.error));
     const userId = currentUser(request).id;
     await prisma.$transaction(async (tx) => {
       const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
       if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-      const existingVersion = (request.body as { version?: number } | undefined)?.version;
-      if (existingVersion && existingVersion !== book.version) {
-        throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
-      }
+      const fold = await loadEntityFold(tx, 'BOOK', bookId);
+      const verdict = adjudicateMutation(fold, 'DELETE', parsed.data?.version);
+      if (verdict.kind === 'REJECT') throw revisionConflictError(verdict.code);
       const now = new Date();
       const [dogEars, annotations, rereadMarks, reflections] = await Promise.all([
-        tx.dogEar.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.annotation.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.rereadMark.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.completionReflection.findMany({ where: { bookId, deletedAt: null }, select: { id: true } })
+        tx.dogEar.findMany({ where: { bookId, deletedAt: null } }),
+        tx.annotation.findMany({ where: { bookId, deletedAt: null } }),
+        tx.rereadMark.findMany({ where: { bookId, deletedAt: null } }),
+        tx.completionReflection.findMany({ where: { bookId, deletedAt: null } })
       ]);
       await Promise.all([
-        tx.dogEar.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
-        tx.annotation.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
-        tx.rereadMark.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
-        tx.completionReflection.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } })
+        ...dogEars.map((item) =>
+          tx.dogEar.updateMany({
+            where: { id: item.id, deletedAt: null, version: item.version },
+            data: { deletedAt: now, version: { increment: 1 } }
+          })
+        ),
+        ...annotations.map((item) =>
+          tx.annotation.updateMany({
+            where: { id: item.id, deletedAt: null, version: item.version },
+            data: { deletedAt: now, version: { increment: 1 } }
+          })
+        ),
+        ...rereadMarks.map((item) =>
+          tx.rereadMark.updateMany({
+            where: { id: item.id, deletedAt: null, version: item.version },
+            data: { deletedAt: now, version: { increment: 1 } }
+          })
+        ),
+        ...reflections.map((item) =>
+          tx.completionReflection.updateMany({
+            where: { id: item.id, deletedAt: null, version: item.version },
+            data: { deletedAt: now, version: { increment: 1 } }
+          })
+        )
       ]);
-      await tx.book.update({
-        where: { id: bookId },
+      const result = await tx.book.updateMany({
+        where: { id: bookId, deletedAt: null, version: fold.version },
         data: { deletedAt: now, version: { increment: 1 } }
       });
+      if (result.count !== 1) throw revisionConflictError('STALE_WRITE');
       await writeEvent(tx, {
         userId,
         bookId,
         entityType: 'BOOK',
         entityId: bookId,
+        entityVersion: verdict.nextVersion,
         action: 'DELETED',
-        payload: { bookTitle: book.title }
+        payload: { bookTitle: book.title },
+        snapshot: bookSnapshot(book),
+        baseVersion: parsed.data?.version ?? null
       });
-      const childEvents = [
-        ...dogEars.map((item) => ({ entityType: 'DOG_EAR' as const, id: item.id })),
-        ...annotations.map((item) => ({ entityType: 'ANNOTATION' as const, id: item.id })),
-        ...rereadMarks.map((item) => ({ entityType: 'REREAD_MARK' as const, id: item.id })),
-        ...reflections.map((item) => ({ entityType: 'COMPLETION_REFLECTION' as const, id: item.id }))
+      const childEvents: Array<{
+        entityType: 'DOG_EAR' | 'ANNOTATION' | 'REREAD_MARK' | 'COMPLETION_REFLECTION';
+        id: string;
+        entityVersion: number;
+        snapshot: Record<string, unknown>;
+      }> = [
+        ...dogEars.map((item) => ({
+          entityType: 'DOG_EAR' as const,
+          id: item.id,
+          entityVersion: item.version + 1,
+          snapshot: dogEarSnapshot(item)
+        })),
+        ...annotations.map((item) => ({
+          entityType: 'ANNOTATION' as const,
+          id: item.id,
+          entityVersion: item.version + 1,
+          snapshot: annotationSnapshot(item)
+        })),
+        ...rereadMarks.map((item) => ({
+          entityType: 'REREAD_MARK' as const,
+          id: item.id,
+          entityVersion: item.version + 1,
+          snapshot: rereadMarkSnapshot(item)
+        })),
+        ...reflections.map((item) => ({
+          entityType: 'COMPLETION_REFLECTION' as const,
+          id: item.id,
+          entityVersion: item.version + 1,
+          snapshot: reflectionSnapshot(item)
+        }))
       ];
       for (const child of childEvents) {
         await writeEvent(tx, {
@@ -495,8 +569,11 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
           bookId,
           entityType: child.entityType,
           entityId: child.id,
+          entityVersion: child.entityVersion,
           action: 'DELETED',
-          payload: { cascade: true }
+          payload: { cascade: true },
+          snapshot: child.snapshot,
+          baseVersion: null
         });
       }
     });

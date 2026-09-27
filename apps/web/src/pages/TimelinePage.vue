@@ -142,6 +142,7 @@ onMounted(async () => {
             <RouterLink v-if="event.bookId" :to="`/books/${event.bookId}`">{{ event.bookTitle }}</RouterLink>
             <span v-else>{{ event.bookTitle }}</span>
             <span v-if="summary(event)"> · {{ summary(event) }}</span>
+            <span v-if="event.entityVersion !== undefined" class="muted"> · 修订 v{{ event.entityVersion }}</span>
           </p>
         </div>
       </article>
