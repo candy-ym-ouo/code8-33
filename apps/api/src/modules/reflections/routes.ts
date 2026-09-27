@@ -1,6 +1,6 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { MOOD_TAGS, type MoodTag } from '@paper-book-traces/shared';
+import { MOOD_TAGS, type EventClientKind, type MoodTag } from '@paper-book-traces/shared';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
@@ -50,6 +50,11 @@ function assertVersion(current: number, requested?: number): void {
   if (requested && requested !== current) {
     throw new AppError(409, 'STALE_WRITE', '完成感受已在其他位置被修改，请刷新后重试');
   }
+}
+
+/** 携带 version 的请求按版本化写入处理；旧客户端省略 version 时记为盲写，供事后复算标记。 */
+function clientKindFor(requested?: number): EventClientKind {
+  return requested === undefined ? 'LEGACY' : 'VERSIONED';
 }
 
 export const reflectionRoutes: FastifyPluginAsync = async (app) => {
@@ -106,7 +111,10 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
           completionRound: existing.completionRound,
           moodTags,
           summary: reflection ? reflection.slice(0, 120) : ''
-        }
+        },
+        baseRevision: parsed.data.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data.version)
       });
       return tx.completionReflection.findUniqueOrThrow({ where: { id } });
     });
@@ -144,7 +152,10 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'COMPLETION_REFLECTION',
         entityId: id,
         action: 'DELETED',
-        payload: { completionRound: existing.completionRound }
+        payload: { completionRound: existing.completionRound },
+        baseRevision: parsed.data?.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data?.version)
       });
       const latestActive = await tx.completionReflection.aggregate({
         where: { bookId: existing.bookId, deletedAt: null },
@@ -161,7 +172,10 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
           entityType: 'BOOK',
           entityId: existing.bookId,
           action: 'STATUS_CHANGED',
-          payload: { previousStatus: 'READ', nextStatus: 'READING', reason: 'reflection_deleted' }
+          payload: { previousStatus: 'READ', nextStatus: 'READING', reason: 'reflection_deleted' },
+          baseRevision: currentBook.version,
+          revision: currentBook.version + 1,
+          clientKind: 'SYSTEM'
         });
       }
     });
@@ -208,7 +222,9 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'COMPLETION_REFLECTION',
         entityId: id,
         action: 'RESTORED',
-        payload: { completionRound: value.completionRound }
+        payload: { completionRound: value.completionRound },
+        baseRevision: existing.version,
+        revision: existing.version + 1
       });
       await writeEvent(tx, {
         userId,
@@ -216,7 +232,10 @@ export const reflectionRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'BOOK',
         entityId: existing.bookId,
         action: 'STATUS_CHANGED',
-        payload: { previousStatus: 'READING', nextStatus: 'READ', reason: 'reflection_restored' }
+        payload: { previousStatus: 'READING', nextStatus: 'READ', reason: 'reflection_restored' },
+        baseRevision: book.version,
+        revision: book.version + 1,
+        clientKind: 'SYSTEM'
       });
       return value;
     });

@@ -814,6 +814,36 @@ small,
   margin: 0.35rem 0;
 }
 
+.timeline-flag {
+  margin-left: 0.5rem;
+  padding: 0.1rem 0.45rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.timeline-superseded {
+  opacity: 0.62;
+}
+
+.timeline-superseded .timeline-dot {
+  background: var(--muted);
+  box-shadow: 0 0 0 1px var(--muted);
+}
+
+.timeline-conflict .timeline-dot {
+  background: #9b3c35;
+  box-shadow: 0 0 0 1px #9b3c35;
+}
+
+.timeline-conflict-note {
+  color: #9b3c35;
+  font-size: 0.85rem;
+}
+
 .settings-section {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(300px, 0.8fr);

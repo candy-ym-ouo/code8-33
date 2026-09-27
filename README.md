@@ -92,6 +92,9 @@ npm run dev
 - 折角使用 PostgreSQL 部分唯一索引，只约束未删除记录。
 - 完成感受使用 `completion_round` 区分多次读完整本书。
 - 书目和痕迹使用 `version` 防止多端写入覆盖。
+- 每个 `ActivityEvent` 的 `payloadJson` 都带有修订元数据：`baseRevision`（写入依据的版本，旧客户端省略 `version` 时为 `null`）、`revision`（落库后的版本）、`clientKind`（`VERSIONED` / `LEGACY` / `SYSTEM`）、`seq`（事务内序号）、`cascade`（服务端级联）。
+- 时间线按 `occurredAt → seq → id` 确定性排序；服务端对事件流做纯函数重放（`apps/api/src/lib/replay.ts`），可从存量事件复算每个实体的当前状态、被取代事件与冲突（过期写入、旧端盲覆盖、旧端盲删除、并列恢复等），无元数据的旧事件按旧端盲写兼容处理。
+- 恢复接口使用事务内条件更新，并发重复恢复只有一次生效，不会产生并列"恢复"事件。
 - 所有查询强制带 `userId` 条件，越权资源统一返回 404。
 
 ## 常用命令

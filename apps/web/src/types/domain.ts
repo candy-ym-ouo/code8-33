@@ -1,6 +1,14 @@
-import type { ActivityAction, ActivityEntityType, BookStatus, MoodTag, TraceType } from '@paper-book-traces/shared';
+import type { ActivityAction, ActivityEntityType, BookStatus, ConflictReason, MoodTag, TraceType } from '@paper-book-traces/shared';
 
-export type { ActivityAction, ActivityEntityType, BookStatus, MoodTag, TraceType };
+export type { ActivityAction, ActivityEntityType, BookStatus, ConflictReason, MoodTag, TraceType };
+
+export interface TimelineConflict {
+  eventId: string;
+  reason: ConflictReason;
+  message: string;
+  baseRevision: number | null;
+  actualRevision: number | null;
+}
 
 export interface User {
   id: string;
@@ -91,6 +99,9 @@ export interface TimelineEvent {
   action: ActivityAction;
   payload: Record<string, unknown>;
   occurredAt: string;
+  current?: boolean;
+  superseded?: boolean;
+  conflict?: TimelineConflict | null;
 }
 
 export interface Pagination {
@@ -140,4 +151,13 @@ export const ENTITY_LABELS: Record<ActivityEntityType, string> = {
   ANNOTATION: '批注',
   REREAD_MARK: '重读页',
   COMPLETION_REFLECTION: '完成感受'
+};
+
+export const CONFLICT_LABELS: Record<ConflictReason, string> = {
+  STALE_REVISION: '过期写入',
+  BLIND_OVERWRITE: '旧端覆盖',
+  BLIND_DELETE: '旧端删除',
+  BLIND_RESTORE: '旧端恢复',
+  LIFECYCLE_MISMATCH: '状态矛盾',
+  UNKNOWN: '无法对应'
 };

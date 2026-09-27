@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
-import { TRACE_TYPES, type TraceType } from '@paper-book-traces/shared';
+import { TRACE_TYPES, type EventClientKind, type TraceType } from '@paper-book-traces/shared';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
@@ -105,6 +105,11 @@ function assertVersion(current: number, requested?: number): void {
   if (requested && requested !== current) {
     throw new AppError(409, 'STALE_WRITE', '记录已在其他位置被修改，请刷新后重试');
   }
+}
+
+/** 携带 version 的请求按版本化写入处理；旧客户端省略 version 时记为盲写，供事后复算标记。 */
+function clientKindFor(requested?: number): EventClientKind {
+  return requested === undefined ? 'LEGACY' : 'VERSIONED';
 }
 
 function eventSummary(value: string | null | undefined): string {
@@ -220,7 +225,9 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
           entityType: 'DOG_EAR',
           entityId: created.id,
           action: 'CREATED',
-          payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
+          payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) },
+          baseRevision: null,
+          revision: 1
         });
         return created;
       });
@@ -274,7 +281,10 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'DOG_EAR',
         entityId: id,
         action: 'UPDATED',
-        payload: { pageNumber: nextPage, reason: eventSummary(nextReason) }
+        payload: { pageNumber: nextPage, reason: eventSummary(nextReason) },
+        baseRevision: parsed.data.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data.version)
       });
       return tx.dogEar.findUniqueOrThrow({ where: { id } });
     });
@@ -301,7 +311,10 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'DOG_EAR',
         entityId: id,
         action: 'DELETED',
-        payload: { pageNumber: existing.pageNumber }
+        payload: { pageNumber: existing.pageNumber },
+        baseRevision: parsed.data?.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data?.version)
       });
     });
     return reply.status(204).send();
@@ -316,25 +329,39 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
       throw new AppError(409, 'RESTORE_WINDOW_EXPIRED', '已超过 24 小时恢复窗口');
     }
     if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
-    const duplicate = await prisma.dogEar.findFirst({
-      where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
-    });
-    if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
-    const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.dogEar.update({
-        where: { id },
-        data: { deletedAt: null, version: { increment: 1 } }
+    let restored;
+    try {
+      restored = await prisma.$transaction(async (tx) => {
+        const duplicate = await tx.dogEar.findFirst({
+          where: { bookId: existing.bookId, pageNumber: existing.pageNumber, deletedAt: null, id: { not: id } }
+        });
+        if (duplicate) throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
+        const result = await tx.dogEar.updateMany({
+          where: { id, userId, deletedAt: { not: null } },
+          data: { deletedAt: null, version: { increment: 1 } }
+        });
+        if (result.count !== 1) {
+          throw new AppError(409, 'RESTORE_CONFLICT', '折角状态已变化，请刷新后重试');
+        }
+        const value = await tx.dogEar.findUniqueOrThrow({ where: { id } });
+        await writeEvent(tx, {
+          userId,
+          bookId: value.bookId,
+          entityType: 'DOG_EAR',
+          entityId: id,
+          action: 'RESTORED',
+          payload: { pageNumber: value.pageNumber },
+          baseRevision: existing.version,
+          revision: existing.version + 1
+        });
+        return value;
       });
-      await writeEvent(tx, {
-        userId,
-        bookId: value.bookId,
-        entityType: 'DOG_EAR',
-        entityId: id,
-        action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
-      });
-      return value;
-    });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        throw new AppError(409, 'DOG_EAR_EXISTS', '该页已有有效折角，无法恢复');
+      }
+      throw error;
+    }
     return { dogEar: serializeDogEar(restored) };
   });
 
@@ -362,7 +389,9 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'ANNOTATION',
         entityId: created.id,
         action: 'CREATED',
-        payload: { startPage: created.startPage, endPage: created.endPage, summary: eventSummary(created.content) }
+        payload: { startPage: created.startPage, endPage: created.endPage, summary: eventSummary(created.content) },
+        baseRevision: null,
+        revision: 1
       });
       return created;
     });
@@ -400,7 +429,10 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'ANNOTATION',
         entityId: id,
         action: 'UPDATED',
-        payload: { startPage, endPage }
+        payload: { startPage, endPage },
+        baseRevision: parsed.data.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data.version)
       });
       return tx.annotation.findUniqueOrThrow({ where: { id } });
     });
@@ -427,7 +459,10 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'ANNOTATION',
         entityId: id,
         action: 'DELETED',
-        payload: { startPage: existing.startPage, endPage: existing.endPage }
+        payload: { startPage: existing.startPage, endPage: existing.endPage },
+        baseRevision: parsed.data?.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data?.version)
       });
     });
     return reply.status(204).send();
@@ -443,17 +478,23 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     }
     if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.annotation.update({
-        where: { id },
+      const result = await tx.annotation.updateMany({
+        where: { id, userId, deletedAt: { not: null } },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) {
+        throw new AppError(409, 'RESTORE_CONFLICT', '批注状态已变化，请刷新后重试');
+      }
+      const value = await tx.annotation.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'ANNOTATION',
         entityId: id,
         action: 'RESTORED',
-        payload: { startPage: value.startPage, endPage: value.endPage }
+        payload: { startPage: value.startPage, endPage: value.endPage },
+        baseRevision: existing.version,
+        revision: existing.version + 1
       });
       return value;
     });
@@ -483,7 +524,9 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: created.id,
         action: 'CREATED',
-        payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) }
+        payload: { pageNumber: created.pageNumber, reason: eventSummary(created.reason) },
+        baseRevision: null,
+        revision: 1
       });
       return created;
     });
@@ -521,7 +564,10 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'UPDATED',
-        payload: { pageNumber, reason: eventSummary(reason) }
+        payload: { pageNumber, reason: eventSummary(reason) },
+        baseRevision: parsed.data.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data.version)
       });
       return tx.rereadMark.findUniqueOrThrow({ where: { id } });
     });
@@ -548,7 +594,10 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'DELETED',
-        payload: { pageNumber: existing.pageNumber }
+        payload: { pageNumber: existing.pageNumber },
+        baseRevision: parsed.data?.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data?.version)
       });
     });
     return reply.status(204).send();
@@ -564,17 +613,23 @@ export const traceRoutes: FastifyPluginAsync = async (app) => {
     }
     if (existing.book.deletedAt) throw new AppError(409, 'BOOK_DELETED', '所属书目已删除');
     const restored = await prisma.$transaction(async (tx) => {
-      const value = await tx.rereadMark.update({
-        where: { id },
+      const result = await tx.rereadMark.updateMany({
+        where: { id, userId, deletedAt: { not: null } },
         data: { deletedAt: null, version: { increment: 1 } }
       });
+      if (result.count !== 1) {
+        throw new AppError(409, 'RESTORE_CONFLICT', '重读记录状态已变化，请刷新后重试');
+      }
+      const value = await tx.rereadMark.findUniqueOrThrow({ where: { id } });
       await writeEvent(tx, {
         userId,
         bookId: value.bookId,
         entityType: 'REREAD_MARK',
         entityId: id,
         action: 'RESTORED',
-        payload: { pageNumber: value.pageNumber }
+        payload: { pageNumber: value.pageNumber },
+        baseRevision: existing.version,
+        revision: existing.version + 1
       });
       return value;
     });

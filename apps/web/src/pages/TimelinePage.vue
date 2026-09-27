@@ -6,6 +6,7 @@ import { formatDateTime } from '../api/format';
 import ErrorNotice from '../components/ErrorNotice.vue';
 import {
   ACTION_LABELS,
+  CONFLICT_LABELS,
   ENTITY_LABELS,
   MOOD_LABELS,
   type ActivityAction,
@@ -131,17 +132,28 @@ onMounted(async () => {
       <p>创建书目或留下第一处阅读痕迹后，时间会从这里开始。</p>
     </div>
     <div v-else class="timeline-page-list">
-      <article v-for="event in events" :key="event.id" class="timeline-item card">
+      <article
+        v-for="event in events"
+        :key="event.id"
+        class="timeline-item card"
+        :class="{ 'timeline-superseded': event.superseded, 'timeline-conflict': event.conflict }"
+      >
         <span class="timeline-dot" aria-hidden="true" />
         <div class="timeline-content">
           <div class="timeline-heading">
-            <strong>{{ ACTION_LABELS[event.action] }} · {{ ENTITY_LABELS[event.entityType] }}</strong>
+            <strong>
+              {{ ACTION_LABELS[event.action] }} · {{ ENTITY_LABELS[event.entityType] }}
+              <span v-if="event.superseded" class="timeline-flag">已被后续变化取代</span>
+            </strong>
             <time :datetime="event.occurredAt">{{ formatDateTime(event.occurredAt) }}</time>
           </div>
           <p>
             <RouterLink v-if="event.bookId" :to="`/books/${event.bookId}`">{{ event.bookTitle }}</RouterLink>
             <span v-else>{{ event.bookTitle }}</span>
             <span v-if="summary(event)"> · {{ summary(event) }}</span>
+          </p>
+          <p v-if="event.conflict" class="timeline-conflict-note" role="status">
+            ⚠ {{ CONFLICT_LABELS[event.conflict.reason] }}：{{ event.conflict.message }}
           </p>
         </div>
       </article>

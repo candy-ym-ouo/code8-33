@@ -8,6 +8,7 @@ import ErrorNotice from '../components/ErrorNotice.vue';
 import MoodPicker from '../components/MoodPicker.vue';
 import {
   ACTION_LABELS,
+  CONFLICT_LABELS,
   ENTITY_LABELS,
   MOOD_LABELS,
   STATUS_LABELS,
@@ -16,6 +17,7 @@ import {
   type BookStatus,
   type MoodTag,
   type Reflection,
+  type TimelineConflict,
   type Trace,
   type TraceType
 } from '../types/domain';
@@ -31,7 +33,17 @@ const book = ref<Book | null>(null);
 const bookView = computed(() => book.value as Book);
 const traces = ref<Trace[]>([]);
 const reflections = ref<Reflection[]>([]);
-const activities = ref<Array<{ id: string; action: keyof typeof ACTION_LABELS; entityType: keyof typeof ENTITY_LABELS; payload: Record<string, unknown>; occurredAt: string }>>([]);
+const activities = ref<
+  Array<{
+    id: string;
+    action: keyof typeof ACTION_LABELS;
+    entityType: keyof typeof ENTITY_LABELS;
+    payload: Record<string, unknown>;
+    occurredAt: string;
+    superseded?: boolean;
+    conflict?: TimelineConflict | null;
+  }>
+>([]);
 const loading = ref(true);
 const saving = ref(false);
 const error = ref('');
@@ -521,11 +533,22 @@ onMounted(load);
       </div>
 
       <div v-else-if="activeTab === 'TIMELINE'" class="timeline-list">
-        <article v-for="event in activities" :key="event.id" class="timeline-item">
+        <article
+          v-for="event in activities"
+          :key="event.id"
+          class="timeline-item"
+          :class="{ 'timeline-superseded': event.superseded, 'timeline-conflict': event.conflict }"
+        >
           <span class="timeline-dot" aria-hidden="true" />
           <div>
-            <strong>{{ ACTION_LABELS[event.action] }}{{ ENTITY_LABELS[event.entityType] }}</strong>
+            <strong>
+              {{ ACTION_LABELS[event.action] }}{{ ENTITY_LABELS[event.entityType] }}
+              <span v-if="event.superseded" class="timeline-flag">已被后续变化取代</span>
+            </strong>
             <p>{{ eventSummary(event.payload) || '记录随时间更新' }}</p>
+            <p v-if="event.conflict" class="timeline-conflict-note" role="status">
+              ⚠ {{ CONFLICT_LABELS[event.conflict.reason] }}：{{ event.conflict.message }}
+            </p>
             <time :datetime="event.occurredAt">{{ formatDateTime(event.occurredAt) }}</time>
           </div>
         </article>

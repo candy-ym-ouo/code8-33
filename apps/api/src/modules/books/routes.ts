@@ -1,7 +1,13 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { Prisma } from '@prisma/client';
 import { z } from 'zod';
-import { BOOK_STATUSES, MOOD_TAGS, type BookStatus, type MoodTag } from '@paper-book-traces/shared';
+import {
+  BOOK_STATUSES,
+  MOOD_TAGS,
+  type BookStatus,
+  type EventClientKind,
+  type MoodTag
+} from '@paper-book-traces/shared';
 import { prisma } from '../../lib/prisma.js';
 import { AppError, zodFields } from '../../lib/errors.js';
 import { currentUser, requireAuth } from '../../lib/auth.js';
@@ -78,6 +84,16 @@ const statusSchema = z.object({
   version: z.number().int().positive().optional(),
   reflection: reflectionInputSchema.optional()
 });
+
+const deleteBookSchema = z
+  .object({ version: z.number().int().positive().optional() })
+  .nullable()
+  .optional();
+
+/** 携带 version 的请求按版本化写入处理；旧客户端省略 version 时记为盲写，供事后复算标记。 */
+function clientKindFor(requested?: number): EventClientKind {
+  return requested === undefined ? 'LEGACY' : 'VERSIONED';
+}
 
 function serializeReflection(reflection: {
   id: string;
@@ -254,7 +270,9 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'BOOK',
         entityId: created.id,
         action: 'CREATED',
-        payload: { bookTitle: created.title, status: created.status }
+        payload: { bookTitle: created.title, status: created.status },
+        baseRevision: null,
+        revision: 1
       });
       return created;
     });
@@ -343,7 +361,10 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
         payload: {
           bookTitle: normalizeText(parsed.data.title ?? existing.title),
           previousStatus: existing.status,
-        }
+        },
+        baseRevision: parsed.data.version ?? null,
+        revision: existing.version + 1,
+        clientKind: clientKindFor(parsed.data.version)
       });
       return tx.book.findUniqueOrThrow({ where: { id: bookId } });
     });
@@ -415,7 +436,10 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
           entityType: 'BOOK',
           entityId: bookId,
           action: 'STATUS_CHANGED',
-          payload: { previousStatus: book.status, nextStatus: 'READ', completionRound }
+          payload: { previousStatus: book.status, nextStatus: 'READ', completionRound },
+          baseRevision: parsed.data.version ?? null,
+          revision: book.version + 1,
+          clientKind: clientKindFor(parsed.data.version)
         });
         await writeEvent(tx, {
           userId,
@@ -423,7 +447,9 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
           entityType: 'COMPLETION_REFLECTION',
           entityId: reflection.id,
           action: 'COMPLETED',
-          payload: { moodTags, completionRound }
+          payload: { moodTags, completionRound },
+          baseRevision: null,
+          revision: 1
         });
         return { book: updated, reflection: serializeReflection(reflection) };
       }
@@ -438,7 +464,10 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
         entityType: 'BOOK',
         entityId: bookId,
         action: 'STATUS_CHANGED',
-        payload: { previousStatus: book.status, nextStatus: parsed.data.status }
+        payload: { previousStatus: book.status, nextStatus: parsed.data.status },
+        baseRevision: parsed.data.version ?? null,
+        revision: book.version + 1,
+        clientKind: clientKindFor(parsed.data.version)
       });
       return { book: updated, reflection: null };
     });
@@ -450,20 +479,25 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
 
   app.delete('/books/:bookId', async (request, reply) => {
     const bookId = parseId((request.params as { bookId: string }).bookId, 'bookId');
+    const parsed = deleteBookSchema.safeParse(request.body);
+    if (!parsed.success) {
+      throw new AppError(422, 'VALIDATION_ERROR', '删除参数无效', zodFields(parsed.error));
+    }
     const userId = currentUser(request).id;
+    const requestedVersion = parsed.data?.version;
     await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM books WHERE id = ${bookId}::uuid AND user_id = ${userId}::uuid FOR UPDATE`;
       const book = await tx.book.findFirst({ where: { id: bookId, userId, deletedAt: null } });
       if (!book) throw new AppError(404, 'NOT_FOUND', '书目不存在');
-      const existingVersion = (request.body as { version?: number } | undefined)?.version;
-      if (existingVersion && existingVersion !== book.version) {
+      if (requestedVersion !== undefined && requestedVersion !== book.version) {
         throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
       }
       const now = new Date();
       const [dogEars, annotations, rereadMarks, reflections] = await Promise.all([
-        tx.dogEar.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.annotation.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.rereadMark.findMany({ where: { bookId, deletedAt: null }, select: { id: true } }),
-        tx.completionReflection.findMany({ where: { bookId, deletedAt: null }, select: { id: true } })
+        tx.dogEar.findMany({ where: { bookId, deletedAt: null }, select: { id: true, version: true } }),
+        tx.annotation.findMany({ where: { bookId, deletedAt: null }, select: { id: true, version: true } }),
+        tx.rereadMark.findMany({ where: { bookId, deletedAt: null }, select: { id: true, version: true } }),
+        tx.completionReflection.findMany({ where: { bookId, deletedAt: null }, select: { id: true, version: true } })
       ]);
       await Promise.all([
         tx.dogEar.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
@@ -471,23 +505,29 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
         tx.rereadMark.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } }),
         tx.completionReflection.updateMany({ where: { bookId, deletedAt: null }, data: { deletedAt: now, version: { increment: 1 } } })
       ]);
-      await tx.book.update({
-        where: { id: bookId },
+      const result = await tx.book.updateMany({
+        where: { id: bookId, userId, deletedAt: null, version: book.version },
         data: { deletedAt: now, version: { increment: 1 } }
       });
+      if (result.count !== 1) {
+        throw new AppError(409, 'STALE_WRITE', '书目已在其他位置被修改，请刷新后重试');
+      }
       await writeEvent(tx, {
         userId,
         bookId,
         entityType: 'BOOK',
         entityId: bookId,
         action: 'DELETED',
-        payload: { bookTitle: book.title }
+        payload: { bookTitle: book.title },
+        baseRevision: requestedVersion ?? null,
+        revision: book.version + 1,
+        clientKind: clientKindFor(requestedVersion)
       });
       const childEvents = [
-        ...dogEars.map((item) => ({ entityType: 'DOG_EAR' as const, id: item.id })),
-        ...annotations.map((item) => ({ entityType: 'ANNOTATION' as const, id: item.id })),
-        ...rereadMarks.map((item) => ({ entityType: 'REREAD_MARK' as const, id: item.id })),
-        ...reflections.map((item) => ({ entityType: 'COMPLETION_REFLECTION' as const, id: item.id }))
+        ...dogEars.map((item) => ({ entityType: 'DOG_EAR' as const, ...item })),
+        ...annotations.map((item) => ({ entityType: 'ANNOTATION' as const, ...item })),
+        ...rereadMarks.map((item) => ({ entityType: 'REREAD_MARK' as const, ...item })),
+        ...reflections.map((item) => ({ entityType: 'COMPLETION_REFLECTION' as const, ...item }))
       ];
       for (const child of childEvents) {
         await writeEvent(tx, {
@@ -496,7 +536,11 @@ export const bookRoutes: FastifyPluginAsync = async (app) => {
           entityType: child.entityType,
           entityId: child.id,
           action: 'DELETED',
-          payload: { cascade: true }
+          payload: { cascade: true },
+          baseRevision: child.version,
+          revision: child.version + 1,
+          clientKind: 'SYSTEM',
+          cascade: true
         });
       }
     });
